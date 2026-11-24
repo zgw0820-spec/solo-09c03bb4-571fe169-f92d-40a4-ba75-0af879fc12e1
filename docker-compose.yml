@@ -12,6 +12,10 @@ services:
       RESTORE_ARCHIVE_DIR: /backups
       RESTORE_OUTPUT_DIR: /restored
       RESTORE_MAX_CONCURRENT: "2"
+      # Files written but not yet fsynced, and the total declared bytes they
+      # may account for. Override per request through POST /api/restores.
+      RESTORE_MAX_PENDING_FLUSH_FILES: "${RESTORE_MAX_PENDING_FLUSH_FILES:-16}"
+      RESTORE_MAX_PENDING_FLUSH_BYTES: "${RESTORE_MAX_PENDING_FLUSH_BYTES:-67108864}"
     volumes:
       # Backups are mounted read-only: the service never writes to them.
       - ./backups:/backups:ro

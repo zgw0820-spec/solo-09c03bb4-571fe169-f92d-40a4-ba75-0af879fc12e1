@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 
 from .restore import (
     InvalidArchive,
+    InvalidConfiguration,
     InvalidSelection,
     LinkError,
     MalformedArchive,
@@ -49,6 +50,23 @@ class RestoreRequest(BaseModel):
         ...,
         description="Directory to restore, relative to the archive root (e.g. 'data/2024')",
         examples=["data/2024"],
+    )
+    max_pending_flush_files: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Maximum number of files written but not yet fsynced at the same time. "
+            "Defaults to RESTORE_MAX_PENDING_FLUSH_FILES (16)."
+        ),
+    )
+    max_pending_flush_bytes: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Maximum total declared bytes of files written but not yet fsynced. "
+            "Defaults to RESTORE_MAX_PENDING_FLUSH_BYTES (64 MiB). A single larger "
+            "file is still restored synchronously, occupying the whole budget."
+        ),
     )
 
 
@@ -156,25 +174,31 @@ def create_restore(request: RestoreRequest) -> RestoreResponse:
             "too many concurrent restores, retry shortly",
         )
     try:
-        result = restore_directory(archive_path, request.path, OUTPUT_DIR)
+        result = restore_directory(
+            archive_path,
+            request.path,
+            OUTPUT_DIR,
+            max_pending_flush_files=request.max_pending_flush_files,
+            max_pending_flush_bytes=request.max_pending_flush_bytes,
+        )
     except InvalidSelection as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     except NotADirectory as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     except PathNotFound as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    except LinkError as exc:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
-    except MalformedArchive as exc:
+    except (LinkError, MalformedArchive, InvalidConfiguration) as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     except InvalidArchive as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    except OSError as exc:
+        # Includes per-file writes and the asynchronous fsync failures: the
+        # staging tree has already been drained and removed at this point.
+        logger.exception("restore failed with OS error")
+        raise HTTPException(status.HTTP_507_INSUFFICIENT_STORAGE, str(exc)) from exc
     except RestoreError as exc:
         logger.exception("restore failed")
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, str(exc)) from exc
-    except OSError as exc:
-        logger.exception("restore failed with OS error")
-        raise HTTPException(status.HTTP_507_INSUFFICIENT_STORAGE, str(exc)) from exc
     finally:
         _restore_slots.release()
 

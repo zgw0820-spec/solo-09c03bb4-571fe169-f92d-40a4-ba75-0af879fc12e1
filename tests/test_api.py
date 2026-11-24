@@ -138,3 +138,61 @@ def test_concurrent_restores_get_separate_directories(client):
     assert 201 in codes
     paths = {r.json()["restored_path"] for r in results if r.status_code == 201}
     assert len(paths) == len([r for r in results if r.status_code == 201])
+
+
+def test_restore_exposes_flush_limits_in_schema(client):
+    c, _a, _r = client
+    schema = c.get("/openapi.json").json()
+    body = schema["components"]["schemas"]["RestoreRequest"]
+    props = body["properties"]
+    assert "max_pending_flush_files" in props
+    assert "max_pending_flush_bytes" in props
+    # Both are optional, so the documented example request keeps working.
+    assert schema["components"]["schemas"]["RestoreRequest"].get("required") == [
+        "archive",
+        "path",
+    ]
+
+
+def test_restore_accepts_per_request_flush_limits(client):
+    c, archives, restored = client
+    name = _make_archive(archives)
+    response = c.post(
+        "/api/restores",
+        json={
+            "archive": name,
+            "path": "data/2024",
+            "max_pending_flush_files": 2,
+            "max_pending_flush_bytes": 4096,
+        },
+    )
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["files"] >= 3
+    assert os.path.isfile(os.path.join(body["restored_path"], "inside.txt"))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"max_pending_flush_files": 0},
+        {"max_pending_flush_bytes": -1},
+        {"max_pending_flush_files": "many"},
+    ],
+)
+def test_restore_rejects_invalid_flush_limits(client, payload):
+    c, archives, _r = client
+    name = _make_archive(archives)
+    response = c.post(
+        "/api/restores", json={"archive": name, "path": "data/2024", **payload}
+    )
+    assert response.status_code == 422
+
+
+def test_restore_rejects_invalid_environment_limits(client, monkeypatch):
+    c, archives, _r = client
+    name = _make_archive(archives)
+    monkeypatch.setenv("RESTORE_MAX_PENDING_FLUSH_FILES", "nope")
+    response = c.post("/api/restores", json={"archive": name, "path": "data/2024"})
+    assert response.status_code == 422
+    assert "RESTORE_MAX_PENDING_FLUSH_FILES" in response.json()["detail"]

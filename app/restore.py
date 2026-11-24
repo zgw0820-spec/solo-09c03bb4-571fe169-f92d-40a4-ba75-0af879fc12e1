@@ -19,6 +19,16 @@ Guarantees
 * Restoration is staged in a hidden directory; the final directory is only
   published with one atomic ``rename`` after every byte and every hard link is
   in place.  Any failure removes everything produced by that attempt.
+* With ``fsync`` enabled, each payload is handed to a bounded asynchronous
+  fsync pipeline.  A file reserves one slot and its *full declared size* from
+  the moment writing starts until its fsync succeeds, so the next member can be
+  decompressed and written while earlier files are still being flushed.  One
+  file larger than the byte budget may still be restored: it takes the whole
+  pipeline for its own write and flush and blocks other members meanwhile.
+  Links that resolve to the same original share one payload write, so they are
+  charged once.  The published rename happens only after every pending fsync
+  has succeeded.  After a write or fsync failure no new write is started, the
+  in-flight operations are allowed to finish, and only then is staging removed.
 """
 
 from __future__ import annotations
@@ -27,14 +37,24 @@ import logging
 import os
 import shutil
 import tarfile
+import threading
 import uuid
 import zlib
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
-from typing import BinaryIO, Optional
+from typing import IO, Optional
 
 logger = logging.getLogger(__name__)
 
 CHUNK_SIZE = 1024 * 1024  # 1 MiB
+
+# Defaults for the per-restore fsync pipeline.  They bound how many files may
+# be written but not yet flushed, and how many payload bytes those files
+# account for (each file is charged its full declared size).
+DEFAULT_MAX_PENDING_FLUSH_FILES = 16
+DEFAULT_MAX_PENDING_FLUSH_BYTES = 64 * 1024 * 1024
+ENV_MAX_PENDING_FLUSH_FILES = "RESTORE_MAX_PENDING_FLUSH_FILES"
+ENV_MAX_PENDING_FLUSH_BYTES = "RESTORE_MAX_PENDING_FLUSH_BYTES"
 
 DIR = "dir"
 FILE = "file"
@@ -71,6 +91,10 @@ class InvalidArchive(RestoreError):
     """The archive cannot be read as a gzip-compressed tar stream."""
 
 
+class InvalidConfiguration(RestoreError):
+    """A restore option (usually an environment setting) is unusable."""
+
+
 @dataclass
 class Member:
     name: str
@@ -96,6 +120,54 @@ class RestoreResult:
 
     def as_dict(self) -> dict:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class FlushLimits:
+    """Per-restore bounds for the asynchronous fsync pipeline."""
+
+    max_files: int
+    max_bytes: int
+
+
+def _parse_limit(value: object, default: int, label: str) -> int:
+    if value is None:
+        value = default
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise InvalidConfiguration(f"{label} must be an integer, got {value!r}")
+    if value < 1:
+        raise InvalidConfiguration(f"{label} must be >= 1, got {value!r}")
+    return value
+
+
+def _env_limit(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError as exc:
+        raise InvalidConfiguration(
+            f"{name} must be an integer, got {raw!r}"
+        ) from exc
+    return _parse_limit(value, default, name)
+
+
+def resolve_flush_limits(
+    max_files: Optional[int] = None,
+    max_bytes: Optional[int] = None,
+) -> FlushLimits:
+    """Resolve explicit values, then environment defaults."""
+
+    if max_files is None:
+        max_files = _env_limit(ENV_MAX_PENDING_FLUSH_FILES, DEFAULT_MAX_PENDING_FLUSH_FILES)
+    else:
+        max_files = _parse_limit(max_files, DEFAULT_MAX_PENDING_FLUSH_FILES, "max_pending_flush_files")
+    if max_bytes is None:
+        max_bytes = _env_limit(ENV_MAX_PENDING_FLUSH_BYTES, DEFAULT_MAX_PENDING_FLUSH_BYTES)
+    else:
+        max_bytes = _parse_limit(max_bytes, DEFAULT_MAX_PENDING_FLUSH_BYTES, "max_pending_flush_bytes")
+    return FlushLimits(max_files=max_files, max_bytes=max_bytes)
 
 
 def normalize_member_name(raw: str) -> str:
@@ -161,7 +233,7 @@ def _open_stream(path: str) -> tarfile.TarFile:
         raise InvalidArchive(f"cannot open archive {path!r}: {exc}") from exc
 
 
-def _drain(reader: Optional[BinaryIO], stats: RestoreResult) -> None:
+def _drain(reader: Optional[IO[bytes]], stats: RestoreResult) -> None:
     if reader is None:
         return
     while True:
@@ -169,6 +241,12 @@ def _drain(reader: Optional[BinaryIO], stats: RestoreResult) -> None:
         if not chunk:
             return
         stats.bytes_extracted += len(chunk)
+
+
+def _fsync_fd(fd: int) -> None:
+    """fsync a payload descriptor (indirection keeps failure tests simple)."""
+
+    os.fsync(fd)
 
 
 def _fsync_dir(path: str) -> None:
@@ -196,36 +274,227 @@ def _dir_mode(mode: int) -> int:
     return (mode & 0o777) | 0o700
 
 
-def _write_payload(
-    reader: BinaryIO,
+def _write_all(fd: int, chunk: bytes) -> None:
+    view = memoryview(chunk)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:  # pragma: no cover - defensive
+            raise OSError("short write to restored file")
+        view = view[written:]
+
+
+def _safe_close(fd: Optional[int]) -> None:
+    if fd is None:
+        return
+    try:
+        os.close(fd)
+    except OSError:  # pragma: no cover - defensive
+        pass
+
+
+def _copy_payload(
+    reader: IO[bytes],
     dest: str,
     member: Member,
     stats: RestoreResult,
-    fsync: bool,
-) -> None:
+) -> int:
+    """Stream one member to ``dest``; return the still-open file descriptor."""
+
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     fd = os.open(dest, flags, 0o600)
     written = 0
-    with os.fdopen(fd, "wb") as out:
+    try:
         while True:
             chunk = reader.read(CHUNK_SIZE)
             if not chunk:
                 break
             stats.bytes_extracted += len(chunk)
-            out.write(chunk)
+            _write_all(fd, chunk)
             written += len(chunk)
-        out.flush()
-        os.fchmod(out.fileno(), _file_mode(member.mode))
-        if fsync:
-            os.fsync(out.fileno())
-    if member.mtime > 0:
+        os.fchmod(fd, _file_mode(member.mode))
+        if member.mtime > 0:
+            try:
+                os.utime(fd, (member.mtime, member.mtime))
+            except OSError:
+                pass
+    except BaseException:
+        _safe_close(fd)
         try:
-            os.utime(dest, (member.mtime, member.mtime), follow_symlinks=False)
+            os.unlink(dest)
         except OSError:
             pass
+        raise
     stats.bytes_written += written
+    return fd
+
+
+def _write_payload(
+    reader: IO[bytes],
+    dest: str,
+    member: Member,
+    stats: RestoreResult,
+    fsync: bool,
+) -> None:
+    """Synchronous write (and optional fsync) of a single member."""
+
+    fd = _copy_payload(reader, dest, member, stats)
+    try:
+        if fsync:
+            _fsync_fd(fd)
+    finally:
+        _safe_close(fd)
+
+
+class _PendingBudget:
+    """Admission control for files that are written but not yet flushed.
+
+    A reservation accounts for the member's full declared size even while only
+    part of it has been read, and is released only when its fsync has finished
+    (successfully or not).  A file bigger than the byte budget may start once
+    the pipeline is idle; it then owns the pipeline until its flush completes.
+    """
+
+    def __init__(self, limits: FlushLimits) -> None:
+        self.max_files = limits.max_files
+        self.max_bytes = limits.max_bytes
+        self._cond = threading.Condition()
+        self._files = 0
+        self._bytes = 0
+        self._active = 0
+        self._exclusive = False
+        self._error: Optional[BaseException] = None
+
+    def reserve(self, size: int) -> None:
+        if size < 0:  # pragma: no cover - archive sizes are non-negative
+            raise ValueError("size must not be negative")
+        with self._cond:
+            while True:
+                if self._error is not None:
+                    raise self._error
+                if self._exclusive:
+                    self._cond.wait()
+                    continue
+                if size > self.max_bytes:
+                    if self._active == 0:
+                        self._exclusive = True
+                        self._take(size)
+                        return
+                elif self._files < self.max_files and self._bytes + size <= self.max_bytes:
+                    self._take(size)
+                    return
+                self._cond.wait()
+
+    def _take(self, size: int) -> None:
+        self._files += 1
+        self._bytes += size
+        self._active += 1
+
+    def done(self, size: int) -> None:
+        with self._cond:
+            self._files -= 1
+            self._bytes -= size
+            self._active -= 1
+            self._exclusive = False
+            self._cond.notify_all()
+
+    def fail(self, exc: BaseException) -> None:
+        with self._cond:
+            if self._error is None:
+                self._error = exc
+            self._cond.notify_all()
+
+
+class _DirectSink:
+    """``fsync`` disabled: write straight through, as before."""
+
+    def __init__(self, stats: RestoreResult) -> None:
+        self._stats = stats
+
+    def write(self, reader: IO[bytes], dest: str, member: Member) -> None:
+        _write_payload(reader, dest, member, self._stats, False)
+
+    def finalize(self) -> None:
+        return
+
+    def close(self) -> None:
+        return
+
+
+class _PipelineSink:
+    """Write payloads on the caller thread, fsync them on a bounded pool."""
+
+    def __init__(self, stats: RestoreResult, limits: FlushLimits) -> None:
+        self._stats = stats
+        self._budget = _PendingBudget(limits)
+        self._pool = ThreadPoolExecutor(
+            max_workers=min(4, limits.max_files),
+            thread_name_prefix="restore-fsync",
+        )
+        self._futures: list[Future] = []
+        self._closed = False
+
+    def write(self, reader: IO[bytes], dest: str, member: Member) -> None:
+        size = member.size
+        # Reserve before the first byte is written: from now until fsync the
+        # file is charged at its full size, and this call blocks while the
+        # pending-file / pending-byte budget is exhausted.
+        self._budget.reserve(size)
+        try:
+            fd = _copy_payload(reader, dest, member, self._stats)
+        except BaseException:
+            self._budget.done(size)
+            raise
+        self._submit(fd, size)
+
+    def _submit(self, fd: int, size: int) -> None:
+        def flush() -> None:
+            try:
+                _fsync_fd(fd)
+            except BaseException as exc:
+                self._budget.fail(exc)
+                raise
+            finally:
+                _safe_close(fd)
+                self._budget.done(size)
+
+        try:
+            self._futures.append(self._pool.submit(flush))
+        except RuntimeError as exc:  # pragma: no cover - shutdown race
+            _safe_close(fd)
+            self._budget.done(size)
+            raise RestoreError(f"cannot schedule fsync: {exc}") from exc
+
+    def finalize(self) -> None:
+        """Wait for every flush and re-raise the first failure."""
+
+        self._shutdown()
+        first: Optional[BaseException] = None
+        for future in self._futures:
+            exc = future.exception()
+            if exc is not None and first is None:
+                first = exc
+        if first is not None:
+            raise first
+
+    def close(self) -> None:
+        self._shutdown()
+
+    def _shutdown(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        # Running tasks always release their budget reservation in ``finally``;
+        # waiting here is what lets the caller clean up staging without racing
+        # an in-flight write or fsync.
+        self._pool.shutdown(wait=True)
+
+
+def _make_sink(fsync: bool, limits: FlushLimits, stats: RestoreResult) -> "_DirectSink | _PipelineSink":
+    if fsync:
+        return _PipelineSink(stats, limits)
+    return _DirectSink(stats)
 
 
 class _OutputTree:
@@ -277,7 +546,7 @@ class _OutputTree:
             raise MalformedArchive(f"duplicate or conflicting member {rel!r}")
         self.file_paths.add(rel)
 
-    def finalize_dirs(self, fsync: bool) -> None:
+    def finalize_dirs(self) -> None:
         for rel in sorted(self.dir_paths, key=lambda p: p.count("/"), reverse=True):
             path = self.dest(rel)
             mode, mtime = self.dir_meta.get(rel, (0o755, 0.0))
@@ -285,10 +554,14 @@ class _OutputTree:
                 os.chmod(path, _dir_mode(mode))
                 if mtime > 0:
                     os.utime(path, (mtime, mtime))
-                if fsync:
-                    _fsync_dir(path)
             except OSError as exc:  # pragma: no cover - unusual filesystem
                 logger.warning("could not finalise directory %s: %s", path, exc)
+
+    def sync_dirs(self) -> None:
+        """fsync every staging directory after all payloads are durable."""
+
+        for rel in sorted(self.dir_paths, key=lambda p: p.count("/"), reverse=True):
+            _fsync_dir(self.dest(rel))
 
 
 def _resolve_hardlink(
@@ -353,8 +626,8 @@ def _populate(
     selection: str,
     output_root: str,
     stats: RestoreResult,
-    fsync: bool,
-) -> _Plan:
+    sink: "_DirectSink | _PipelineSink",
+) -> _OutputTree:
     tree = _OutputTree(output_root)
     members: dict[str, Member] = {}
     selected_files: set[str] = set()
@@ -428,7 +701,7 @@ def _populate(
                     reader = stream.extractfile(info)
                     if reader is None:
                         raise MalformedArchive(f"cannot read payload of {name!r}")
-                    _write_payload(reader, tree.dest(rel), member, stats, fsync)
+                    sink.write(reader, tree.dest(rel), member)
                     selected_files.add(name)
                     stats.files += 1
                 else:
@@ -476,10 +749,11 @@ def _populate(
             plan.external[source] = _rel(canonical, selection)
 
     if plan.external:
-        _fetch_external(archive_path, members, plan, tree, stats, fsync)
+        _fetch_external(archive_path, members, plan, tree, stats, sink)
 
     # Create the hard links only after every payload exists, so forward and
-    # chained references are all resolvable.
+    # chained references are all resolvable.  No new payload writes happen
+    # here; the source may still be flushing.
     for source, entries in plan.groups.items():
         canonical_path = tree.dest(plan.destination_rel(source, selection))
         for entry in entries:
@@ -493,7 +767,7 @@ def _populate(
 
     if selection_member is not None:
         tree.dir_meta[""] = (selection_member.mode, selection_member.mtime)
-    tree.finalize_dirs(fsync)
+    tree.finalize_dirs()
     stats.directories = len(tree.dir_paths)
 
     if stats.bytes_extracted > 2 * stats.archive_payload_bytes:
@@ -501,7 +775,7 @@ def _populate(
             "internal error: extracted byte budget exceeded "
             f"({stats.bytes_extracted} > 2 x {stats.archive_payload_bytes})"
         )
-    return plan
+    return tree
 
 
 def _fetch_external(
@@ -510,9 +784,14 @@ def _fetch_external(
     plan: _Plan,
     tree: _OutputTree,
     stats: RestoreResult,
-    fsync: bool,
+    sink: "_DirectSink | _PipelineSink",
 ) -> None:
-    """Second pass: copy link targets that live outside the selection."""
+    """Second pass: copy link targets that live outside the selection.
+
+    These writes go through the same sink, so they obey the same pending-file
+    and pending-byte limits.  Each archive source is fetched once no matter how
+    many retained hard links point at it.
+    """
 
     remaining = set(plan.external)
     if not remaining:
@@ -533,7 +812,7 @@ def _fetch_external(
                 reader = stream.extractfile(info)
                 if reader is None:
                     raise MalformedArchive(f"cannot read payload of {name!r}")
-                _write_payload(reader, tree.dest(canonical_rel), members[name], stats, fsync)
+                sink.write(reader, tree.dest(canonical_rel), members[name])
                 remaining.remove(name)
                 if not remaining:
                     break
@@ -576,12 +855,29 @@ def restore_directory(
     restore_root: str,
     *,
     fsync: Optional[bool] = None,
+    max_pending_flush_files: Optional[int] = None,
+    max_pending_flush_bytes: Optional[int] = None,
 ) -> RestoreResult:
-    """Restore ``selection`` from ``archive_path`` and publish it atomically."""
+    """Restore ``selection`` from ``archive_path`` and publish it atomically.
+
+    ``max_pending_flush_files`` and ``max_pending_flush_bytes`` bound the
+    asynchronous fsync pipeline for this attempt; when omitted they come from
+    ``RESTORE_MAX_PENDING_FLUSH_FILES`` / ``RESTORE_MAX_PENDING_FLUSH_BYTES``
+    and then from built-in defaults.  They are ignored when ``fsync`` is off.
+    """
 
     selection = normalize_selection(selection)
     if fsync is None:
         fsync = os.environ.get("RESTORE_FSYNC", "1").lower() not in ("0", "false", "no")
+    if fsync:
+        limits = resolve_flush_limits(max_pending_flush_files, max_pending_flush_bytes)
+    else:
+        # Flushing is off, so the pipeline bounds are irrelevant and a stale
+        # environment setting must not break restores.
+        limits = FlushLimits(
+            max_files=DEFAULT_MAX_PENDING_FLUSH_FILES,
+            max_bytes=DEFAULT_MAX_PENDING_FLUSH_BYTES,
+        )
     if not os.path.isfile(archive_path):
         raise PathNotFound(f"archive {archive_path!r} does not exist")
 
@@ -596,16 +892,27 @@ def restore_directory(
     token_dir = os.path.join(staging_root, token)
     output_root = os.path.join(token_dir, basename)
     stats = RestoreResult(requested_path=selection)
+    sink = _make_sink(fsync, limits, stats)
 
     try:
         os.makedirs(token_dir, mode=0o700)
         os.mkdir(output_root, 0o700)
         try:
-            _populate(archive_path, selection, output_root, stats, fsync)
+            tree = _populate(archive_path, selection, output_root, stats, sink)
+            # Nothing is published until every payload (and every directory
+            # entry) is durable.  finalize() waits for in-flight flushes and
+            # re-raises the first write/fsync failure.
+            sink.finalize()
+            if fsync:
+                tree.sync_dirs()
         except (tarfile.TarError, EOFError, zlib.error) as exc:
             raise InvalidArchive(f"corrupt or truncated archive: {exc}") from exc
         stats.restored_path = _publish(token_dir, restore_root, restore_id, basename, fsync)
     except BaseException:
+        # Stop starting new writes, let the in-flight ones finish (their budget
+        # slots and descriptors are released by then), and only then remove the
+        # staging tree.  Other restores are unaffected: all state lives here.
+        sink.close()
         _cleanup(
             [
                 os.path.join(restore_root, restore_id),
